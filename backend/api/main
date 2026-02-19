@@ -1,0 +1,232 @@
+from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi.responses import Response, FileResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.middleware.cors import CORSMiddleware
+from rembg import remove, new_session
+from PIL import Image, UnidentifiedImageError, ImageFile
+import io
+import logging
+import traceback
+import os
+from pathlib import Path
+
+# 解决PIL处理大图片/截断图片的问题
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+# 增加PIL缓存限制，避免内存溢出
+Image.MAX_IMAGE_PIXELS = None  # 解除像素限制（根据需求可设具体值，如1024*1024*20）
+
+# 日志配置优化
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Background Removal API", version="1.0")
+
+# 添加 CORS 中间件
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 允许所有来源
+    allow_credentials=True,
+    allow_methods=["*"],  # 允许所有 HTTP 方法
+    allow_headers=["*"],  # 允许所有请求头
+)
+
+# 挂载静态文件目录
+static_dir = Path(__file__).parent.parent / "static"
+if static_dir.exists():
+    app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+    logger.info(f"Static files mounted at /static -> {static_dir}")
+else:
+    logger.warning(f"Static directory not found: {static_dir}")
+# 全局会话（支持多模型，增加容错）
+_SESSIONS = {
+    "u2netp": None,
+    "u2net": None
+}
+
+def get_session(model_name: str = "u2netp"):
+    """获取rembg会话（增加重试机制）"""
+    global _SESSIONS
+    max_retries = 2
+    retry_count = 0
+    
+    while retry_count < max_retries:
+        try:
+            if _SESSIONS[model_name] is None:
+                logger.info(f"Loading {model_name} model session...")
+                # 显式指定模型路径（避免下载失败）
+                _SESSIONS[model_name] = new_session(model_name)
+                logger.info(f"{model_name} session loaded successfully")
+            return _SESSIONS[model_name]
+        except Exception as e:
+            retry_count += 1
+            logger.error(f"Failed to load {model_name} session (retry {retry_count}/{max_retries}): {e}")
+            _SESSIONS[model_name] = None
+            if retry_count >= max_retries:
+                raise RuntimeError(f"Failed to load {model_name} model after {max_retries} retries")
+
+@app.get("/health")
+def health_check():
+    """健康检查（增加模型会话状态）"""
+    session_status = {k: "loaded" if v else "unloaded" for k, v in _SESSIONS.items()}
+    return {
+        "status": "ok",
+        "models": session_status,
+        "pil_max_pixels": Image.MAX_IMAGE_PIXELS
+    }
+
+@app.post("/remove-bg")
+async def remove_background(
+    file: UploadFile = File(...),
+    model: str = "u2netp",  # 允许指定模型
+    preserve_alpha: bool = True  # 保留透明通道
+):
+    # 1. 基础参数校验
+    if model not in _SESSIONS.keys():
+        raise HTTPException(status_code=400, detail=f"Invalid model: {model}. Supported: {list(_SESSIONS.keys())}")
+    
+    logger.info(f"Processing file: {file.filename} | Content-Type: {file.content_type} | Model: {model}")
+    
+    try:
+        # 2. 读取文件（增加大小限制）
+        file_size = await file.read(1)  # 先读1字节判断是否为空
+        if not file_size:
+            raise HTTPException(status_code=400, detail="Empty file uploaded")
+        
+        # 重置文件指针并读取全部内容
+        await file.seek(0)
+        image_bytes = await file.read()
+        
+        # 限制文件大小（避免超大文件）
+        max_file_size = 10 * 1024 * 1024  # 10MB
+        if len(image_bytes) > max_file_size:
+            raise HTTPException(status_code=400, detail=f"File too large (max {max_file_size/1024/1024}MB)")
+
+        # 3. 图像解码（增加容错）
+        try:
+            input_image = Image.open(io.BytesIO(image_bytes))
+            # 验证图像完整性
+            input_image.verify()
+            # 重新打开（verify后需要重新加载）
+            input_image = Image.open(io.BytesIO(image_bytes))
+        except UnidentifiedImageError:
+            raise HTTPException(status_code=400, detail="Invalid image format (supported: JPG, PNG, WEBP, BMP)")
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Corrupted image file: {str(e)}")
+
+        logger.info(f"Original image: {input_image.width}x{input_image.height} | Mode: {input_image.mode}")
+
+        # 4. 图像预处理（更安全的格式转换）
+        # 处理特殊模式（如P模式/调色板）
+        if input_image.mode == "P":
+            input_image = input_image.convert("RGBA")
+        
+        # 统一转换为RGB/RGBA（保留alpha通道）
+        if input_image.mode not in ("RGB", "RGBA"):
+            input_image = input_image.convert("RGBA" if preserve_alpha else "RGB")
+
+        # 5. 尺寸调整（避免过小/过大）
+        min_size = 32  # 最小尺寸限制
+        max_size = 1920
+        if input_image.width < min_size or input_image.height < min_size:
+            raise HTTPException(status_code=400, detail=f"Image too small (min {min_size}x{min_size})")
+        
+        # 等比例缩放
+        if input_image.width > max_size or input_image.height > max_size:
+            ratio = min(max_size / input_image.width, max_size / input_image.height)
+            new_size = (int(input_image.width * ratio), int(input_image.height * ratio))
+            input_image = input_image.resize(new_size, Image.Resampling.LANCZOS)
+            logger.info(f"Resized to: {input_image.width}x{input_image.height}")
+
+        # 6. 背景移除（增加alpha_matting优化）
+        try:
+            session = get_session(model)
+            logger.info("Starting background removal...")
+            # 优化rembg参数（提升效果+稳定性）
+            output_image = remove(
+                input_image,
+                session=session,
+                alpha_matting=True,  # 边缘优化
+                alpha_matting_foreground_threshold=240,
+                alpha_matting_background_threshold=10,
+                alpha_matting_erode_size=10
+            )
+        except Exception as e:
+            # 切换备用模型重试
+            logger.error(f"Failed with {model} model: {e}")
+            fallback_model = "u2net" if model == "u2netp" else "u2netp"
+            logger.info(f"Retrying with fallback model: {fallback_model}")
+            session = get_session(fallback_model)
+            output_image = remove(
+                input_image,
+                session=session,
+                alpha_matting=True
+            )
+
+        # 7. 输出验证
+        if output_image is None or not isinstance(output_image, Image.Image):
+            raise RuntimeError("Invalid output from rembg (None or non-Image type)")
+        
+        logger.info(f"Output image: {output_image.width}x{output_image.height} | Mode: {output_image.mode}")
+
+        # 8. 缓冲区处理（关键修复：避免内存泄漏）
+        buffer = io.BytesIO()
+        # 优化PNG保存参数
+        output_image.save(
+            buffer,
+            format="PNG",
+            optimize=True,
+            compress_level=6,  # 平衡压缩率和速度
+            quality=95,
+            lossless=True
+        )
+        buffer.seek(0)  # 重置指针到起始位置
+
+        # 9. 响应返回
+        output_size = buffer.getbuffer().nbytes
+        logger.info(f"Process completed | Output size: {output_size} bytes")
+        
+        return Response(
+            content=buffer.getvalue(),
+            media_type="image/png",
+            headers={
+                "Content-Disposition": f"inline; filename={os.path.splitext(file.filename)[0]}_no_bg.png",
+                "Content-Length": str(output_size)
+            }
+        )
+
+    except HTTPException:
+        # 主动抛出的HTTP异常直接传递
+        raise
+    except Exception as e:
+        # 捕获所有未预期异常
+        error_detail = f"Processing failed: {str(e)}"
+        logger.error(error_detail)
+        logger.error(traceback.format_exc())
+        raise HTTPException(
+            status_code=500,
+            detail=error_detail,
+            headers={"X-Error-Detail": traceback.format_exc().split("\n")[-2] if traceback.format_exc() else "Unknown error"}
+        )
+    finally:
+        # 确保文件句柄关闭
+        await file.close()
+
+# 启动时预加载模型（可选）
+@app.on_event("startup")
+async def startup_event():
+    """服务启动时预加载模型会话"""
+    try:
+        get_session("u2netp")
+        logger.info("Startup: Preloaded u2netp model")
+    except Exception as e:
+        logger.warning(f"Startup: Failed to preload u2netp model: {e}")
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """服务关闭时清理会话"""
+    global _SESSIONS
+    _SESSIONS = {k: None for k in _SESSIONS.keys()}
+    logger.info("Shutdown: Cleared all model sessions")
