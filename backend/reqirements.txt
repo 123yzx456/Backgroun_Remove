@@ -1,0 +1,33 @@
+# Web 框架和服务器
+fastapi==0.129.0
+uvicorn[standard]==0.41.0
+python-multipart==0.0.22
+
+# 背景移除核心库
+rembg==2.0.72
+
+# 图像处理
+Pillow==12.1.1
+
+# 机器学习和深度学习依赖
+onnxruntime==1.24.1
+numpy==2.3.5
+
+# 背景移除算法依赖
+pymatting==1.1.15
+scikit-image==0.26.0
+scipy==1.17.0
+
+# 性能优化
+numba==0.63.1
+
+# 数据处理（可选）
+pandas==2.2.3
+
+# HTTP 客户端（用于测试）
+requests==2.32.5
+
+# 其他依赖
+tqdm==4.67.3
+filelock==3.24.2
+packaging==26.0
